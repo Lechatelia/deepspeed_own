@@ -659,6 +659,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         world_size = dist.get_world_size(self.dp_process_group)
         my_rank = dist.get_rank(self.dp_process_group)
 
+        # create empty grads
+        for i, param_group in enumerate(self.round_robin_bit16_groups):
+            total_partitions = dist.get_world_size(group=self.real_dp_process_group[i])
+            for partition_id in range(total_partitions):
+                self.set_none_gradients_to_zero(i, partition_id)
+    
+
         # with PP we must create ipg buffer, since backward is handled outside zero
         if pipeline_parallel and self.contiguous_gradients:
             self.ipg_buffer = []
@@ -1386,7 +1393,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         for param_id in self.is_grad_computed[i][partition_id]:
             param = self.param_dict[param_id]
             if param.grad is None:
-                param.grad = torch.zero_like(param)
+                param.grad = torch.zeros_like(param)
 
     ######################Reduction Related Methods##############################
     def allreduce_bucket(self, bucket, rank=None, log=None):
@@ -2138,6 +2145,28 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 ranks = self.get_ep_ranks(
                     group_name=self.optimizer.param_groups[i]['name'])
                 merged_partitions = [merged_partitions[i] for i in ranks]
+
+            # checking mismatching size
+            total_padding_size = sum([single_sd['group_paddings'][i] for single_sd in all_state_dict])
+            if sum([single_partition.numel() for single_partition in  merged_partitions]) != merged_partitions[0].numel()*len(all_state_dict) - total_padding_size:
+                originsize = sum([single_partition.numel() for single_partition in  merged_partitions])
+                newsize = merged_partitions[0].numel()*len(all_state_dict) - total_padding_size
+                print(
+                    f' the size of checkpoint is not correct; attempt to fix that {originsize } --->  {newsize}'
+                )
+                comsum = 0
+                merged_partitions_new = []
+                for singele_patition in merged_partitions:
+                    if comsum + singele_patition.numel() <= newsize:
+                        merged_partitions_new.append(singele_patition)
+                        comsum += singele_patition.numel()
+                    else:
+                        merged_partitions_new.append(singele_patition[:newsize-comsum])
+                        break
+                merged_partitions = merged_partitions_new
+                newsize = sum([single_partition.numel() for single_partition in merged_partitions])
+                print(f'after fix; the size is {newsize}')
+
             flat_merged_partitions = self.flatten_dense_tensors_aligned(
                 merged_partitions,
                 self.nccl_start_alignment_factor *
@@ -2161,7 +2190,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     # Extract optimizer state for current partition from merged states of all partitions
     def _partition_base_optimizer_state(self, state_key, all_partition_states, group_id):
         partition_id = dist.get_rank(group=self.real_dp_process_group[group_id])
-        alignment = dist.get_world_size(group=self.real_dp_process_group[group_id])
+        alignment = dist.get_world_size(group=self.real_dp_process_group[group_id]) * self.nccl_start_alignment_factor
         if torch.is_tensor(all_partition_states[0]):
             flat_merged_partitions = self.flatten_dense_tensors_aligned(
                 all_partition_states,
@@ -2217,6 +2246,28 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 all_partition_states = [
                     all_states[key] for all_states in all_partition_group_states
                 ]
+
+                # checking mismatching size
+                total_padding_size = sum([single_sd['group_paddings'][i] for single_sd in all_state_dict])
+                if  torch.is_tensor(all_partition_states[0]) and sum([single_partition.numel() for single_partition in  all_partition_states]) != all_partition_states[0].numel()*len(all_state_dict) - total_padding_size:
+                    originsize = sum([single_partition.numel() for single_partition in  all_partition_states])
+                    newsize = all_partition_states[0].numel()*len(all_state_dict) - total_padding_size
+                    print(
+                        f' the size of checkpoint for optimizer is not correct; attempt to fix that {originsize } --->  {newsize}'
+                    )
+                    comsum = 0
+                    all_partition_states_new = []
+                    for singele_patition in all_partition_states:
+                        if comsum + singele_patition.numel() <= newsize:
+                            all_partition_states_new.append(singele_patition)
+                            comsum += singele_patition.numel()
+                        else:
+                            all_partition_states_new.append(singele_patition[:newsize-comsum])
+                            break
+                    all_partition_states = all_partition_states_new
+                    newsize = sum([single_partition.numel() for single_partition in all_partition_states])
+                    print(f'after fix; the size is {newsize}')
+
                 partition_states[key] = self._partition_base_optimizer_state(
                     key,
                     all_partition_states,

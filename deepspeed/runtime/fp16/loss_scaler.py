@@ -106,7 +106,7 @@ class DynamicLossScaler(LossScalerBase):
                  min_scale=1,
                  delayed_shift=1,
                  consecutive_hysteresis=False,
-                 raise_error_at_min_scale=True):
+                 raise_error_at_min_scale=False):
         super(DynamicLossScaler, self).__init__(init_scale)
         self.cur_iter = 0
         self.last_overflow_iter = -1
