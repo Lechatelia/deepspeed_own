@@ -324,12 +324,30 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                              force=False)
 
             # Record padding required for alignment
-            if partition_id == dist.get_world_size(
-                    group=self.real_dp_process_group[i]) - 1:
-                padding = self.bit16_groups_flat[i].numel() - sum(
+
+            # new fixed padding length
+            self.padding_version = 'new'
+            self.total_padding_length = self.bit16_groups_flat[i].numel() - sum(
                     [t.numel() for t in self.round_robin_bit16_groups[i]])
+            base_size = self.bit16_groups_flat[i].numel() // dist.get_world_size(group=self.real_dp_process_group[i])
+            assert  self.bit16_groups_flat[i].numel() % dist.get_world_size(group=self.real_dp_process_group[i]) == 0
+
+
+            if (dist.get_world_size(group=self.real_dp_process_group[i]) - 1 - partition_id)*base_size < self.total_padding_length:
+                padding  = min(base_size, self.total_padding_length- (dist.get_world_size(group=self.real_dp_process_group[i]) - 1 - partition_id)*base_size)
             else:
                 padding = 0
+
+            # old padding length
+            # self.padding_version = 'original'
+            # if partition_id == dist.get_world_size(
+            #         group=self.real_dp_process_group[i]) - 1:
+            #     padding = self.bit16_groups_flat[i].numel() - sum(
+            #         [t.numel() for t in self.round_robin_bit16_groups[i]])
+            # else:
+            #     padding = 0
+
+                
             self.groups_padding.append(padding)
 
             if dist.get_rank(group=self.real_dp_process_group[i]) == 0:
@@ -391,7 +409,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         for rank in range(dist.get_world_size()):
             if dist.get_rank() == rank:
                 print(
-                    f"Rank: {rank} partition count {self.partition_count} and sizes{[(p.numel(), self.is_moe_param_group[i] if hasattr(self, 'is_moe_param_group') else False) for i,p in enumerate(self.single_partition_of_fp32_groups)]} "
+                    f"Rank: {rank} partition count {self.partition_count} and sizes{[(p.numel(), self.groups_padding[i], self.is_moe_param_group[i] if hasattr(self, 'is_moe_param_group') else False) for i,p in enumerate(self.single_partition_of_fp32_groups)]} "
                 )
                 dist.barrier()
         #exit(0)
@@ -2148,7 +2166,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             # checking mismatching size
             total_padding_size = sum([single_sd['group_paddings'][i] for single_sd in all_state_dict])
-            if sum([single_partition.numel() for single_partition in  merged_partitions]) != merged_partitions[0].numel()*len(all_state_dict) - total_padding_size:
+            if self.padding_version != 'new' and sum([single_partition.numel() for single_partition in  merged_partitions]) != merged_partitions[0].numel()*len(all_state_dict) - total_padding_size:
                 originsize = sum([single_partition.numel() for single_partition in  merged_partitions])
                 newsize = merged_partitions[0].numel()*len(all_state_dict) - total_padding_size
                 print(
@@ -2249,7 +2267,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
                 # checking mismatching size
                 total_padding_size = sum([single_sd['group_paddings'][i] for single_sd in all_state_dict])
-                if  torch.is_tensor(all_partition_states[0]) and sum([single_partition.numel() for single_partition in  all_partition_states]) != all_partition_states[0].numel()*len(all_state_dict) - total_padding_size:
+                if  torch.is_tensor(all_partition_states[0]) and self.padding_version != 'new'  and sum([single_partition.numel() for single_partition in  all_partition_states]) != all_partition_states[0].numel()*len(all_state_dict) - total_padding_size:
                     originsize = sum([single_partition.numel() for single_partition in  all_partition_states])
                     newsize = all_partition_states[0].numel()*len(all_state_dict) - total_padding_size
                     print(
