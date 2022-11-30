@@ -1896,7 +1896,7 @@ class DeepSpeedEngine(Module):
                         max_norm=self.gradient_clipping(),
                         mpu=self.mpu)
 
-    def _take_model_step(self, lr_kwargs, block_eigenvalue={}):
+    def _take_model_step(self, lr_kwargs, optim_kwargs={}, block_eigenvalue={}):
         if self.gradient_clipping() > 0.0:
             if not (self.fp16_enabled() or self.bfloat16_enabled() or self.amp_enabled()
                     or self.zero_optimization()):
@@ -1908,7 +1908,7 @@ class DeepSpeedEngine(Module):
                 clip_grad_norm_(parameters=master_params,
                                 max_norm=self.gradient_clipping(),
                                 mpu=self.mpu)
-        self.optimizer.step()
+        self.optimizer.step(**optim_kwargs)
 
         if hasattr(self.optimizer, '_global_grad_norm'):
             self._global_grad_norm = self.optimizer._global_grad_norm
@@ -1964,7 +1964,7 @@ class DeepSpeedEngine(Module):
         self.global_steps += 1
         self.global_samples += self.train_batch_size()
 
-    def step(self, lr_kwargs=None):
+    def step(self, lr_kwargs=None, optim_kwargs={}):
         r"""Execute the weight update step after forward and backward propagation
         on effective_train_batch.
         """
@@ -2006,7 +2006,7 @@ class DeepSpeedEngine(Module):
                     and self.quantizer.any_precision_switch()):
                 self._take_model_step(lr_kwargs, self.block_eigenvalue)
             else:
-                self._take_model_step(lr_kwargs)
+                self._take_model_step(lr_kwargs, optim_kwargs)
 
         self.tput_timer.stop(report_progress)
 

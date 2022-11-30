@@ -347,7 +347,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # else:
             #     padding = 0
 
-                
+
             self.groups_padding.append(padding)
 
             if dist.get_rank(group=self.real_dp_process_group[i]) == 0:
@@ -682,7 +682,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             total_partitions = dist.get_world_size(group=self.real_dp_process_group[i])
             for partition_id in range(total_partitions):
                 self.set_none_gradients_to_zero(i, partition_id)
-    
+
 
         # with PP we must create ipg buffer, since backward is handled outside zero
         if pipeline_parallel and self.contiguous_gradients:
@@ -1758,17 +1758,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             bit16_partitions[dist.get_rank(group=self.real_dp_process_group[group_no])]
         ]
 
-    def _optimizer_step(self, group_no):
+    def _optimizer_step(self, group_no,  **kwargs):
         original_param_groups = self.optimizer.param_groups
         self.optimizer.param_groups = [original_param_groups[group_no]]
         from deepspeed.ops.adam import DeepSpeedCPUAdam
         if type(self.optimizer) == DeepSpeedCPUAdam and self.dtype == torch.half:
             self.optimizer.step(fp16_param_groups=[self.get_bit16_param_group(group_no)])
         else:
-            self.optimizer.step()
+            self.optimizer.step(**kwargs)
         self.optimizer.param_groups = original_param_groups
 
-    def step(self, closure=None):
+    def step(self, closure=None, **kwargs):
         """
         Not supporting closure.
         """
@@ -1822,7 +1822,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                             scaled_global_grad_norm)
                 self.stop_timers([OPTIMIZER_GRADIENTS])
                 self.start_timers([OPTIMIZER_STEP])
-                self._optimizer_step(i)
+                self._optimizer_step(i, **kwargs)
 
                 from deepspeed.ops.adam import DeepSpeedCPUAdam
                 if not (type(self.optimizer) == DeepSpeedCPUAdam
@@ -1863,7 +1863,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
                 # Step 3:- run the optimizer if no offloading
                 self.start_timers([OPTIMIZER_STEP])
-                self._optimizer_step(i)
+                self._optimizer_step(i,  **kwargs)
                 # Step 4:- get rid of the fp32 gradients. Not needed anymore
                 self.single_partition_of_fp32_groups[i].grad = None
                 del single_grad_partition
@@ -2169,9 +2169,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             if self.padding_version != 'new' and sum([single_partition.numel() for single_partition in  merged_partitions]) != merged_partitions[0].numel()*len(all_state_dict) - total_padding_size:
                 originsize = sum([single_partition.numel() for single_partition in  merged_partitions])
                 newsize = merged_partitions[0].numel()*len(all_state_dict) - total_padding_size
-                print(
-                    f' the size of checkpoint is not correct; attempt to fix that {originsize } --->  {newsize}'
-                )
+                logger.info(f' the size of checkpoint is not correct; attempt to fix that {originsize } --->  {newsize}')
                 comsum = 0
                 merged_partitions_new = []
                 for singele_patition in merged_partitions:
@@ -2183,7 +2181,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         break
                 merged_partitions = merged_partitions_new
                 newsize = sum([single_partition.numel() for single_partition in merged_partitions])
-                print(f'after fix; the size is {newsize}')
+                logger.info(f'after fix; the size is {newsize}')
 
             flat_merged_partitions = self.flatten_dense_tensors_aligned(
                 merged_partitions,
@@ -2270,7 +2268,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 if  torch.is_tensor(all_partition_states[0]) and self.padding_version != 'new'  and sum([single_partition.numel() for single_partition in  all_partition_states]) != all_partition_states[0].numel()*len(all_state_dict) - total_padding_size:
                     originsize = sum([single_partition.numel() for single_partition in  all_partition_states])
                     newsize = all_partition_states[0].numel()*len(all_state_dict) - total_padding_size
-                    print(
+                    logger.info(
                         f' the size of checkpoint for optimizer is not correct; attempt to fix that {originsize } --->  {newsize}'
                     )
                     comsum = 0
@@ -2284,7 +2282,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                             break
                     all_partition_states = all_partition_states_new
                     newsize = sum([single_partition.numel() for single_partition in all_partition_states])
-                    print(f'after fix; the size is {newsize}')
+                    logger.info(f'after fix; the size is {newsize}')
 
                 partition_states[key] = self._partition_base_optimizer_state(
                     key,
@@ -2366,7 +2364,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         # I think it should actually be ok to reload the optimizer before the model.
         dp_rank = dist.get_rank(group=self.dp_process_group)
-        current_rank_sd = state_dict_list[dp_rank]
+        if dp_rank > len(state_dict_list) - 1:
+            logger.info(f'use the last state_dict from list since gpu size has changed!')
+            current_rank_sd = state_dict_list[-1]
+        else:
+            current_rank_sd = state_dict_list[dp_rank]
         self.loss_scaler = current_rank_sd.get('loss_scaler', self.loss_scaler)
         self.dynamic_loss_scale = current_rank_sd.get('dynamic_loss_scale',
                                                       self.dynamic_loss_scale)
@@ -2398,6 +2400,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         #     self.optimizer.load_state_dict(current_rank_sd[BASE_OPTIMIZER_STATE])
 
         if load_optimizer_states:
+            logger.info(f'please note that \'load_optimizer_states\' is True')
             if ckpt_is_rigid:
                 # loading rigid ckpt into either rigid or elastic exec
                 self.optimizer.load_state_dict(current_rank_sd[BASE_OPTIMIZER_STATE])
