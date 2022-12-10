@@ -429,6 +429,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         self.grads_in_ipg_bucket = []
         self.params_in_ipg_bucket = []
+        self.param_id_in_ipg_bucket = []
         self.elements_in_ipg_bucket = 0
         self.params_already_reduced = []
         self._release_ipg_buffers()
@@ -437,6 +438,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         # simplified param id
         self.param_id = {}
+        self.param_id2grad_count = {}
+        self.param_id2grad_times = {}
 
         #interesting code: unique ids being assigned to individual parameters
         largest_param_numel = 0
@@ -445,6 +448,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             for param in params_group:
                 unique_id = id(param)
                 self.param_id[unique_id] = count
+                self.param_id2grad_times[count] = 1 # default to 1 
+                self.param_id2grad_count[count] = 0 # default to 0 
                 self.param_dict[count] = param
                 self.params_already_reduced.append(False)
                 if param.numel() > largest_param_numel:
@@ -902,33 +907,67 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                          param.numel())
 
         param_id = self.get_param_id(param)
-        assert self.params_already_reduced[param_id] == False, \
-            f"The parameter {param_id} has already been reduced. \
-            Gradient computed twice for this partition. \
-            Multiple gradient reduction is currently not supported"
 
-        if param.numel() > self.reduce_bucket_size:
-            self.extra_large_param_to_reduce = param
+        self.param_id2grad_count[param_id] += 1
 
-        elif self.contiguous_gradients:
-            # keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
-            new_grad_tensor = self.ipg_buffer[self.ipg_index].narrow(
-                0,
-                self.elements_in_ipg_bucket,
-                param.numel())
-            new_grad_tensor.copy_(param.grad.view(-1))
-            param.grad.data = new_grad_tensor.data.view_as(param.grad)
+        
+        if self.param_id2grad_count[param_id] < self.param_id2grad_times[param_id]:
+            # have grad for this param later
+            self.param_id2grad_count[param_id] += 1
+        
+        else:
+            # 
+            if self.param_id2grad_count[param_id] > self.param_id2grad_times[param_id]:
+                # update times
+                self.param_id2grad_times[param_id] = self.param_id2grad_count[param_id]
+                
+                if param_id not in self.param_id_in_ipg_bucket:
+                    logger.warning(f"The parameter {param_id} has already been in the param_id_in_ipg_bucket. \n \
+                        not need add again. \n \
+                        will use jinguo's changed codes")
+                    # self.params_already_reduced[param_id] = False
+               
 
-        self.elements_in_ipg_bucket += param.numel()
 
-        assert param.grad is not None, f"rank {dist.get_rank()} - Invalid to reduce Param {param_id} with None gradient"
 
-        self.grads_in_ipg_bucket.append(param.grad)
-        self.params_in_ipg_bucket.append((i, param, param_id))
+            if self.params_already_reduced[param_id]:
+                logger.warning(f"The parameter {param_id} has already been reduced. \
+                        Gradient computed twice for this partition. \
+                        Multiple gradient reduction is currently not supported. \n \
+                        will use jinguo's changed codes that only use one gradient for the first iter")
+                
+            
 
-        #make sure the average tensor function knows how to average the gradients
-        if is_moe_param(param):
-            self.ipg_bucket_has_moe_params = True
+                # assert self.params_already_reduced[param_id] == False, \
+                #     f"The parameter {param_id} has already been reduced. \
+                #     Gradient computed twice for this partition. \
+                #     Multiple gradient reduction is currently not supported"
+
+            elif param_id not in self.param_id_in_ipg_bucket:
+
+                if param.numel() > self.reduce_bucket_size:
+                    self.extra_large_param_to_reduce = param
+
+                elif self.contiguous_gradients:
+                    # keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
+                    new_grad_tensor = self.ipg_buffer[self.ipg_index].narrow(
+                        0,
+                        self.elements_in_ipg_bucket,
+                        param.numel())
+                    new_grad_tensor.copy_(param.grad.view(-1))
+                    param.grad.data = new_grad_tensor.data.view_as(param.grad)
+
+                self.elements_in_ipg_bucket += param.numel()
+
+                assert param.grad is not None, f"rank {dist.get_rank()} - Invalid to reduce Param {param_id} with None gradient"
+
+                self.grads_in_ipg_bucket.append(param.grad)
+                self.params_in_ipg_bucket.append((i, param, param_id))
+                self.param_id_in_ipg_bucket.append(param_id)
+
+                #make sure the average tensor function knows how to average the gradients
+                if is_moe_param(param):
+                    self.ipg_bucket_has_moe_params = True
 
         self.report_ipg_memory_usage("End ipg_remove_grads", 0)
 
@@ -1339,6 +1378,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         self.grads_in_ipg_bucket = []
         self.params_in_ipg_bucket = []
+        self.param_id_in_ipg_bucket = []
         self.ipg_bucket_has_moe_params = False
         self.elements_in_ipg_bucket = 0
         #####################################################################
@@ -2030,6 +2070,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                     device=torch.cuda.current_device())
                 self.ipg_buffer.append(buf_1)
             self.ipg_index = 0
+
+        for param_id in self.param_id2grad_count:
+            self.param_id2grad_count[param_id] = 0
 
         if self.custom_loss_scaler:
             scaled_loss = self.external_loss_scale * loss
