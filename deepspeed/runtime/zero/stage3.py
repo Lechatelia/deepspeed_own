@@ -167,7 +167,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.module = module
         self.elastic_checkpoint = elastic_checkpoint
 
-        self.__inf_or_nan_tracker: Tensor = torch.zeros(
+        self.inf_or_nan_tracker: Tensor = torch.zeros(
             1,
             dtype=torch.bool,
             device=torch.cuda.current_device(),
@@ -179,12 +179,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.device = torch.cuda.current_device(
         ) if not self.offload_optimizer else OffloadDeviceEnum.cpu
         ### streams used for overlapping computation with communication
-        self.__reduce_and_partition_stream = Stream(
+        self.reduce_and_partition_stream = Stream(
         ) if overlap_comm else torch.cuda.default_stream()
 
         ############################################################################
 
-        self.__n_caching_allocator_flushes = 0
+        self.n_caching_allocator_flushes = 0
 
         #-------------Stage 3 Setup-------------------#
 
@@ -262,12 +262,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if self.swap_optimizer:
             self._configure_tensor_swapping(offload_optimizer_config, aio_config)
 
-        self.__params_in_ipg_bucket: List[Parameter] = []
+        self.params_in_ipg_bucket: List[Parameter] = []
         self.is_gradient_accumulation_boundary: bool = True
 
-        self.__param_reduce_events: Deque[Event] = collections.deque()
+        self.param_reduce_events: Deque[Event] = collections.deque()
         # TODO. make this configurable via JSON
-        self.__max_param_reduce_events: int = 2
+        self.max_param_reduce_events: int = 2
 
         self.param_dict = {}
 
@@ -277,6 +277,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.extra_large_param_to_reduce = None
         self.grads_in_ipg_bucket = []
         self.params_in_ipg_bucket = []
+        self.param_id_in_ipg_bucket = []
 
         self.params_already_reduced = []
         self.is_gradient_accumulation_boundary = True
@@ -285,12 +286,16 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         # simplified param id
         self.param_id = {}
+        self.param_id2grad_count = {}
+        self.param_id2grad_times = {}
 
         count = 0
         for i, params_group in enumerate(self.fp16_groups):
             for param in params_group:
                 unique_id = id(param)
                 self.param_id[unique_id] = count
+                self.param_id2grad_times[count] = 1 # default to 1 
+                self.param_id2grad_count[count] = 0 # default to 0 
                 self.param_dict[count] = param
                 self.params_already_reduced.append(False)
                 count = count + 1
@@ -370,13 +375,13 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         # IPG
         if self.contiguous_gradients:
-            self.__ipg_bucket_flat_buffer: Tensor = torch.empty(
+            self.ipg_bucket_flat_buffer: Tensor = torch.empty(
                 self.reduce_bucket_size,
                 dtype=self.dtype,
                 device=torch.cuda.current_device())
 
         grad_partitions_flat_buffer = None
-        self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
+        self.param_id_to_grad_partition: Dict[int, Tensor] = {}
 
         all_params = list(itertools.chain.from_iterable(self.fp16_groups))
 
@@ -388,7 +393,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         offset = 0
         for param in all_params:
-            self.__param_id_to_grad_partition[
+            self.param_id_to_grad_partition[
                 param.ds_id] = grad_partitions_flat_buffer.narrow(
                     0,
                     offset,
@@ -484,7 +489,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     @property
     def elements_in_ipg_bucket(self):
-        return sum(p.ds_numel for p in self.__params_in_ipg_bucket)
+        return sum(p.ds_numel for p in self.params_in_ipg_bucket)
 
     def _move_to_flat_buffer(self, param_list, flat_buffer, avoid_copy=False):
         '''If flat buffer is None then the parameters in the param_list are
@@ -987,10 +992,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     @instrument_w_nvtx
     def independent_gradient_partition_epilogue(self):
         self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
-        self.__reduce_and_partition_ipg_grads()
+        self.reduce_and_partition_ipg_grads()
         self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
 
-        self.__reduce_and_partition_stream.synchronize()
+        self.reduce_and_partition_stream.synchronize()
 
         # if dist.get_rank() == 0:
         #    logger.info("Params already reduced %s", self.params_already_reduced)
@@ -1002,7 +1007,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if not self.offload_optimizer:
             for i, sub_group in enumerate(self.fp16_groups):
                 self.averaged_gradients[i] = [
-                    self.__param_id_to_grad_partition[param.ds_id]
+                    self.param_id_to_grad_partition[param.ds_id]
                     if param.requires_grad else torch.zeros_like(param.ds_tensor)
                     for param in sub_group
                 ]
@@ -1076,27 +1081,54 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
                                          param.ds_numel)
 
-            self.__reduce_and_partition_ipg_grads()
+            self.reduce_and_partition_ipg_grads()
 
         param_id = self.get_param_id(param)
-        assert self.params_already_reduced[param_id] == False, \
-            f"The parameter {param_id} has already been reduced. \
-            Gradient computed twice for this partition. \
-            Multiple gradient reduction is currently not supported"
+        self.param_id2grad_count[param_id] += 1
 
-        self.__add_grad_to_ipg_bucket(param)
+        if self.param_id2grad_count[param_id] < self.param_id2grad_times[param_id]:
+            # have grad for this param later
+            self.param_id2grad_count[param_id] += 1
+
+        else: 
+            # 
+            if self.param_id2grad_count[param_id] > self.param_id2grad_times[param_id]:
+                # update times
+                self.param_id2grad_times[param_id] = self.param_id2grad_count[param_id]
+                
+                if param_id  in self.param_id_in_ipg_bucket:
+                    logger.warning(f"The parameter {param_id} has already been in the param_id_in_ipg_bucket. \n \
+                        not need add again. \n \
+                        will use jinguo's changed codes")
+                    # self.params_already_reduced[param_id] = False
+
+            
+            if self.params_already_reduced[param_id]:
+                logger.warning(f"The parameter {param_id} has already been reduced. \
+                        Gradient computed twice for this partition. \
+                        Multiple gradient reduction is currently not supported. \n \
+                        will use jinguo's changed codes that only use one gradient for the first forwarding")
+
+                # assert self.params_already_reduced[param_id] == False, \
+                #     f"The parameter {param_id} has already been reduced. \
+                #     Gradient computed twice for this partition. \
+                #     Multiple gradient reduction is currently not supported"
+            
+            elif param_id not in self.param_id_in_ipg_bucket:
+                self.add_grad_to_ipg_bucket(param)
+                self.param_id_in_ipg_bucket.append(param_id)
 
     @instrument_w_nvtx
     @torch.no_grad()
-    def __add_grad_to_ipg_bucket(self, param: Parameter) -> None:
-        self.__reduce_and_partition_stream.wait_stream(torch.cuda.default_stream())
+    def add_grad_to_ipg_bucket(self, param: Parameter) -> None:
+        self.reduce_and_partition_stream.wait_stream(torch.cuda.default_stream())
 
         if self.contiguous_gradients and self.elements_in_ipg_bucket + param.grad.numel(
         ) < self.reduce_bucket_size:
             # move the gradient to a contiguous buffer
-            with torch.cuda.stream(self.__reduce_and_partition_stream):
+            with torch.cuda.stream(self.reduce_and_partition_stream):
                 # move the parameter's gradient to the contiguous flat buffer
-                new_grad_tensor = self.__ipg_bucket_flat_buffer.narrow(
+                new_grad_tensor = self.ipg_bucket_flat_buffer.narrow(
                     0,
                     self.elements_in_ipg_bucket,
                     param.grad.numel()).view_as(param.grad)
@@ -1104,46 +1136,47 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 param.grad.record_stream(torch.cuda.current_stream())
                 param.grad.data = new_grad_tensor
 
-        self.__params_in_ipg_bucket.append(param)
+        self.params_in_ipg_bucket.append(param)
 
     @instrument_w_nvtx
     @torch.no_grad()
-    def __reduce_and_partition_ipg_grads(self, safe_mode: bool = False) -> None:
-        if not self.__params_in_ipg_bucket:
+    def reduce_and_partition_ipg_grads(self, safe_mode: bool = False) -> None:
+        if not self.params_in_ipg_bucket:
             return
 
-        for param in self.__params_in_ipg_bucket:
+        for param in self.params_in_ipg_bucket:
             if param.grad.numel() != param.ds_numel:
                 raise RuntimeError(
                     f"{param.grad.numel()} != {param.ds_numel} Cannot reduce scatter "
                     f"gradients whose size is not same as the params")
 
-        self.__params_in_ipg_bucket.sort(key=lambda p: p.ds_id)
+        self.params_in_ipg_bucket.sort(key=lambda p: p.ds_id)
 
-        assert len(set(p.ds_id for p in self.__params_in_ipg_bucket)) == len(
-            self.__params_in_ipg_bucket)
+        assert len(set(p.ds_id for p in self.params_in_ipg_bucket)) == len(
+            self.params_in_ipg_bucket)
 
-        while self.__param_reduce_events and self.__param_reduce_events[0].query():
-            self.__param_reduce_events.popleft()
-        if len(self.__param_reduce_events) > self.__max_param_reduce_events:
-            self.__param_reduce_events.popleft().synchronize()
+        while self.param_reduce_events and self.param_reduce_events[0].query():
+            self.param_reduce_events.popleft()
+        if len(self.param_reduce_events) > self.max_param_reduce_events:
+            self.param_reduce_events.popleft().synchronize()
 
-        with torch.cuda.stream(self.__reduce_and_partition_stream):
+        with torch.cuda.stream(self.reduce_and_partition_stream):
             if safe_mode:
                 assert_ints_same_as_other_ranks(
-                    [p.ds_id for p in self.__params_in_ipg_bucket])
+                    [p.ds_id for p in self.params_in_ipg_bucket])
 
-            grad_partitions = self.__avg_scatter_grads(self.__params_in_ipg_bucket)
-            self.__partition_grads(self.__params_in_ipg_bucket, grad_partitions)
+            grad_partitions = self.avg_scatter_grads(self.params_in_ipg_bucket)
+            self.partition_grads(self.params_in_ipg_bucket, grad_partitions)
 
-            self.__params_in_ipg_bucket.clear()
+            self.params_in_ipg_bucket.clear()
+            self.param_id_in_ipg_bucket.clear()
 
             event = Event()
             event.record()
-            self.__param_reduce_events.append(event)
+            self.param_reduce_events.append(event)
 
     @instrument_w_nvtx
-    def __avg_scatter_grads(self, params_to_reduce: List[Parameter]) -> List[Tensor]:
+    def avg_scatter_grads(self, params_to_reduce: List[Parameter]) -> List[Tensor]:
         """average gradients and scatter partitions across ranks"""
         dtype = get_only_unique_item(p.grad.dtype for p in params_to_reduce)
 
@@ -1237,7 +1270,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         return total_norm
 
     @instrument_w_nvtx
-    def __partition_grads(self,
+    def partition_grads(self,
                           params_to_release: List[Parameter],
                           grad_partitions: List[Tensor]) -> None:
         offload_fp32_gradients = {}
@@ -1249,7 +1282,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 continue
 
             # move or accumulate gradient partition to target buffer
-            grad_buffer = self.__param_id_to_grad_partition[param.ds_id].narrow(
+            grad_buffer = self.param_id_to_grad_partition[param.ds_id].narrow(
                 0,
                 0,
                 grad_partition.numel())
@@ -1271,14 +1304,14 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 # operations and so it can be used asynchronously
                 grad_buffer = cuda_grad_buffer
 
-            if hasattr(self.__inf_or_nan_tracker, "logical_or_"):
-                self.__inf_or_nan_tracker.logical_or_(torch.isinf(grad_buffer).any())
-                self.__inf_or_nan_tracker.logical_or_(torch.isnan(grad_buffer).any())
+            if hasattr(self.inf_or_nan_tracker, "logical_or_"):
+                self.inf_or_nan_tracker.logical_or_(torch.isinf(grad_buffer).any())
+                self.inf_or_nan_tracker.logical_or_(torch.isnan(grad_buffer).any())
             else:
                 # logical_or_ not available in older versions of pytorch
-                self.__inf_or_nan_tracker += torch.isinf(grad_buffer).any()
-                self.__inf_or_nan_tracker += torch.isnan(grad_buffer).any()
-                self.__inf_or_nan_tracker = self.__inf_or_nan_tracker > 0
+                self.inf_or_nan_tracker += torch.isinf(grad_buffer).any()
+                self.inf_or_nan_tracker += torch.isnan(grad_buffer).any()
+                self.inf_or_nan_tracker = self.inf_or_nan_tracker > 0
 
             # offload the gradient partition if applicable
             if self.offload_optimizer:
@@ -1921,7 +1954,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         alloc_retries = torch.cuda.memory_stats()["num_alloc_retries"] if hasattr(
             torch.cuda,
             "memory_stats") else 0
-        if alloc_retries > self.__n_caching_allocator_flushes:
+        if alloc_retries > self.n_caching_allocator_flushes:
             if dist.get_rank() == 0:
                 logger.warning(
                     "%d pytorch allocator cache flushes since last step. this happens "
@@ -1931,8 +1964,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     "make the cache flushes go away consider adding "
                     "torch.cuda.empty_cache() calls in your training loop to ensure "
                     "that all ranks flush their caches at the same time",
-                    alloc_retries - self.__n_caching_allocator_flushes)
-            self.__n_caching_allocator_flushes = alloc_retries
+                    alloc_retries - self.n_caching_allocator_flushes)
+            self.n_caching_allocator_flushes = alloc_retries
 
     def dump_pre_step_gradients(self, debug_fp32_grads):
         # Dump gradient norms for debugging
@@ -2000,9 +2033,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     @instrument_w_nvtx
     def has_overflow(self, partition_gradients=True):
         if partition_gradients:
-            with torch.cuda.stream(self.__reduce_and_partition_stream):
-                self.local_overflow = bool(self.__inf_or_nan_tracker.item())
-                self.__inf_or_nan_tracker.zero_()
+            with torch.cuda.stream(self.reduce_and_partition_stream):
+                self.local_overflow = bool(self.inf_or_nan_tracker.item())
+                self.inf_or_nan_tracker.zero_()
 
             overflow = self.local_overflow
             #overflow = self.has_overflow_partitioned_grads_serial()
@@ -2062,7 +2095,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.optimizer_swapper.pre_backward()
 
         see_memory_usage(f"Before backward", force=False)
-
+        for param_id in self.param_id2grad_count:
+            self.param_id2grad_count[param_id] = 0
         if self.custom_loss_scaler:
             scaled_loss = self.external_loss_scale * loss
             scaled_loss.backward()
@@ -2078,7 +2112,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         """get fp32 gradient partition dictionary
         accessed as grad_dict[parameter_group_index][parameter_index]
         """
-        self.__reduce_and_partition_stream.synchronize()
+        self.reduce_and_partition_stream.synchronize()
         grad_dict = collections.defaultdict(dict)
         if self.offload_optimizer:
             for group in self.fp16_groups:

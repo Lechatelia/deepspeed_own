@@ -921,7 +921,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 # update times
                 self.param_id2grad_times[param_id] = self.param_id2grad_count[param_id]
                 
-                if param_id not in self.param_id_in_ipg_bucket:
+                if param_id in self.param_id_in_ipg_bucket:
                     logger.warning(f"The parameter {param_id} has already been in the param_id_in_ipg_bucket. \n \
                         not need add again. \n \
                         will use jinguo's changed codes")
