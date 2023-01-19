@@ -688,6 +688,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             for partition_id in range(total_partitions):
                 self.set_none_gradients_to_zero(i, partition_id)
 
+                # # for nan and inf 
+                # if self.loss_scaler.loss_scale <= self.loss_scaler.min_scale:
+                #     self.set_invalid_gradients_to_zero(i, partition_id)
+
 
         # with PP we must create ipg buffer, since backward is handled outside zero
         if pipeline_parallel and self.contiguous_gradients:
@@ -1452,6 +1456,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             param = self.param_dict[param_id]
             if param.grad is None:
                 param.grad = torch.zeros_like(param)
+    
+    # def set_invalid_gradients_to_zero(self, i, partition_id):
+    #     for param_id in self.is_grad_computed[i][partition_id]:
+    #         param = self.param_dict[param_id]
+    #         if torch.isinf(param.grad).any() or torch.isnan(param.grad).any():
+    #             # do not update this param
+    #             param.grad = torch.zeros_like(param)
+        
 
     ######################Reduction Related Methods##############################
     def allreduce_bucket(self, bucket, rank=None, log=None):

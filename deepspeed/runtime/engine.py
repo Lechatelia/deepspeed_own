@@ -1832,6 +1832,22 @@ class DeepSpeedEngine(Module):
 
         self._start_timers(self.engine_timers.backward_reduce_timers)
 
+        # if self.fp16_enabled() and self.zero_optimization():
+        #     fp16_params = []
+        #     for i, group in enumerate(self.optimizer.bit16_groups):
+        #         fp16_params.extend([p for p in group if p.grad is not None])
+        #     self.overflow_local = self.optimizer.has_overflow(False)
+        #     if self.overflow_local:
+        #         for i, (name, param) in enumerate(self.module.named_parameters()):
+        #             if param.grad is not None and self._has_inf_or_nan(
+        #                     param.grad.data,
+        #                     i):
+        #                 print(
+        #                     'params nan with name : {} weight norm: {} weight_grad norm {}'
+        #                     .format(name,
+        #                             param.norm(p=2),
+        #                             param.grad.norm(p=2)))
+
         if allreduce_gradients and self.enable_backward_allreduce:
             # Traditional code path that allreduces the module parameter grads
             self.allreduce_gradients()
@@ -1847,6 +1863,27 @@ class DeepSpeedEngine(Module):
         see_memory_usage("Engine after backward", force=self.memory_breakdown())
 
         return loss
+
+    @staticmethod
+    def _has_inf_or_nan(x, i):
+        try:
+            # if x is half, the .float() incurs an additional deep copy, but it's necessary if
+            # Pytorch's .sum() creates a one-element tensor of the same type as x
+            # (which is true for some recent version of pytorch).
+            cpu_sum = float(x.float().sum())
+            # More efficient version that can be used if .sum() returns a Python scalar
+            # cpu_sum = float(x.sum())
+        except RuntimeError as instance:
+            # We want to check if inst is actually an overflow exception.
+            # RuntimeError could come from a different error.
+            # If so, we still want the exception to propagate.
+            if "value cannot be converted" not in instance.args[0]:
+                raise
+            return True
+        else:
+            if cpu_sum == float('inf') or cpu_sum == -float('inf') or cpu_sum != cpu_sum:
+                return True
+            return False
 
     def is_gradient_accumulation_boundary(self):
         """Query whether the current micro-batch is at the boundary of
@@ -2760,11 +2797,11 @@ class DeepSpeedEngine(Module):
             checkpoint_folder = f'{os.path.join(load_dir, tag)}'
         else:
             if load_optimizer_states and self.dp_world_size != self.loaded_checkpoint_dp_world_size:
-            #     raise ZeRORuntimeException("The checkpoint being loaded used a DP " \
-            #         f"world size of {self.loaded_checkpoint_dp_world_size} but the " \
-            #         f"current world size is {self.dp_world_size}. Automatic adjustment " \
-            #         "of ZeRO's optimizer state partitioning with a new world size is not " \
-            #         "currently supported.")
+                #     raise ZeRORuntimeException("The checkpoint being loaded used a DP " \
+                #         f"world size of {self.loaded_checkpoint_dp_world_size} but the " \
+                #         f"current world size is {self.dp_world_size}. Automatic adjustment " \
+                #         "of ZeRO's optimizer state partitioning with a new world size is not " \
+                #         "currently supported.")
                 print("The checkpoint being loaded used a DP " \
                         f"world size of {self.loaded_checkpoint_dp_world_size} but the " \
                         f"current world size is {self.dp_world_size}. Automatic adjustment " \
