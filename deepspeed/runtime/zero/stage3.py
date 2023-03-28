@@ -836,12 +836,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if self.contiguous_gradients:
             self.ipg_buffer = None
 
-    def _optimizer_step(self, sub_group_id):
+    def _optimizer_step(self, sub_group_id, **kwargs):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
         self.optimizer.param_groups[param_group_id]['params'] = [fp32_param]
 
-        self.optimizer.step()
+        self.optimizer.step(**kwargs)
         self.optimizer.param_groups[param_group_id]['params'] = []
 
     def _swappable_optimizer_subgroup(self, sub_group_id):
@@ -1871,7 +1871,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.external_loss_scale = loss_scale
 
     @instrument_w_nvtx
-    def step(self, closure=None):
+    def step(self, closure=None, **kwargs):
         """
             Not supporting closure.
             """
@@ -1905,7 +1905,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.unscale_and_clip_grads(sub_group_id, scaled_global_grad_norm)
 
             #apply the optimizer step on the sub group and copy fp32 parameters to fp16
-            self._optimizer_step(sub_group_id)
+            self._optimizer_step(sub_group_id, **kwargs)
 
             #put fp16 parameters in appropriate location
             self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
