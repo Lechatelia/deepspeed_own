@@ -1,6 +1,7 @@
-/*
-Copyright 2022 The Microsoft DeepSpeed Team
-*/
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// DeepSpeed Team
 
 #ifndef __HIP_PLATFORM_HCC__
 #include <cuda_profiler_api.h>
@@ -90,8 +91,6 @@ __global__ void bias_add_transform_0213(__half* output,  // q
                                         int head_ext,
                                         int max_out_tokens)
 {
-#if __CUDA_ARCH__ >= 700
-
     unsigned half_dim = (rotary_dim << 3) >> 1;
     int d0_stride = hidden_dim * seq_length;
     int d1_stride = hidden_dim;
@@ -146,8 +145,6 @@ __global__ void bias_add_transform_0213(__half* output,  // q
         output_vec[d3] = q;
     } else
         output_vec[d3] = vals_vec[d3];
-
-#endif
 }
 
 // [B S C*H] - > C * [B A S N]
@@ -269,7 +266,6 @@ __global__ void pad_add_transform_0213(__half* output,
                                        int heads,
                                        int padded_head_size)
 {
-#if __CUDA_ARCH__ >= 700
     float4 ZERO;
     const __half2 zero_h = __float2half2_rn(0.f);
     __half2* ZERO_h = reinterpret_cast<__half2*>(&ZERO);
@@ -303,8 +299,6 @@ __global__ void pad_add_transform_0213(__half* output,
         output_vec[d3] = vals_vec[d3];
     else
         output_vec[d3] = ZERO;
-
-#endif
 }
 
 template <typename T>
@@ -409,8 +403,6 @@ __global__ void bias_add_transform_0213<__half>(__half* output,
                                                 int heads,
                                                 int head_ext)
 {
-#ifdef HALF_PRECISION_AVAILABLE
-
     int d0_stride = hidden_dim * seq_length;
     int d1_stride = hidden_dim;
     int d2_stride = hidden_dim / heads;
@@ -455,8 +447,6 @@ __global__ void bias_add_transform_0213<__half>(__half* output,
     output_half[2] = vals_half[2] + bias_half[2];
     output_half[3] = vals_half[3] + bias_half[3];
     output_vec[d3] = output_arr;
-
-#endif
 }
 
 __global__ void bias_add_transform_0213_v2(__half* output,
@@ -466,7 +456,6 @@ __global__ void bias_add_transform_0213_v2(__half* output,
                                            int seq_length,
                                            int heads)
 {
-#ifdef HALF_PRECISION_AVAILABLE
     __shared__ float4 in_data[3072];
 
     int d0_stride = hidden_dim * seq_length;
@@ -528,7 +517,6 @@ __global__ void bias_add_transform_0213_v2(__half* output,
         output_vec[out_index + iter_offset] =
             in_data[iter_row * d2_stride + d3 + (d2 % 2) * (d1_stride * blockDim.z)];
     }
-#endif
 }
 
 template <typename T>
@@ -580,8 +568,6 @@ __global__ void transform4d_0213<__half>(__half* out,
                                          int hidden_dim,
                                          int head_ext)
 {
-#if __CUDA_ARCH__ >= 700
-
     int d0_stride = hidden_dim * (seq_length / head_ext);
     int d1_stride = hidden_dim;
     int d2_stride = hidden_dim / heads;
@@ -606,8 +592,6 @@ __global__ void transform4d_0213<__half>(__half* out,
     out_vec += (d2 * d1_stride * gridDim.y);
 
     out_vec[d3] = in_vec[d3];
-
-#endif
 }
 
 __global__ void transform4d_0213_v2(__half* out,
@@ -616,7 +600,6 @@ __global__ void transform4d_0213_v2(__half* out,
                                     int seq_length,
                                     int hidden_dim)
 {
-#if __CUDA_ARCH__ >= 700
     __shared__ float4 in_data[3072];
 
     int d0_stride = hidden_dim * seq_length;
@@ -657,7 +640,6 @@ __global__ void transform4d_0213_v2(__half* out,
         int iter_id = iter * iteration_stride + iter_index;
         out_vec[output_offset + iter_id] = in_data[iter_id];
     }
-#endif
 }
 
 // 3 * [B A S N] - > [B S C*H]

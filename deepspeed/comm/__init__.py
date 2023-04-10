@@ -1,3 +1,8 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# DeepSpeed Team
+
 import torch
 from .utils import *
 from deepspeed import utils
@@ -19,7 +24,10 @@ if older_torch():
         return group.WORLD
 
     def get_global_rank(group, group_rank):
-        from torch.distributed.distributed_c10d import _get_global_rank
+        if hasattr(torch.distributed.distributed_c10d, "get_global_rank"):
+            from torch.distributed.distributed_c10d import get_global_rank as _get_global_rank
+        else:
+            from torch.distributed.distributed_c10d import _get_global_rank
         return _get_global_rank(group, group_rank)
 
     def allgather_fn(output_tensor, input_tensor, group=None, async_op=False):
@@ -34,13 +42,8 @@ if older_torch():
         input_tensor_lst = list(chunk(input_tensor, get_world_size(group)))
         return reduce_scatter(output_tensor, input_tensor_lst, group=group)
 
-    def configure(deepspeed_config=None,
-                  enabled=None,
-                  prof_all=None,
-                  prof_ops=None,
-                  verbose=None):
-        utils.logger.warn(
-            "Communication logging is not supported in torch versions older than 1.8")
+    def configure(deepspeed_config=None, enabled=None, prof_all=None, prof_ops=None, verbose=None):
+        utils.logger.warn("Communication logging is not supported in torch versions older than 1.8")
 
 else:
     supported_torch_version = True
